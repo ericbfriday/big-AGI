@@ -39,8 +39,10 @@ export function aixToOpenAIChatCompletions(openAIDialect: OpenAIDialects, model:
   const hotFixRemoveEmptyMessages = openAIDialect === 'perplexity';
   const hotFixRemoveStreamOptions = openAIDialect === 'azure' || openAIDialect === 'mistral';
   const hotFixSquashMultiPartText = openAIDialect === 'deepseek';
-  const hotFixThrowCannotFC = openAIDialect === 'openrouter' /* OpenRouter FC support is not good (as of 2024-07-15) */ || openAIDialect === 'perplexity';
-  const hotFixVndORIncludeReasoning = openAIDialect === 'openrouter'; // [OpenRouter, 2025-01-24] has a special `include_reasoning` field to show the chain of thought
+  const hotFixThrowCannotFC =
+    // [OpenRouter] 2025-10-02: do not throw, rather let it fail if upstream has issues
+    // openAIDialect === 'openrouter' || /* OpenRouter FC support is not good (as of 2024-07-15) */
+    openAIDialect === 'perplexity';
 
   // Model incompatibilities -> Hotfixes
 
@@ -87,10 +89,6 @@ export function aixToOpenAIChatCompletions(openAIDialect: OpenAIDialects, model:
     user: undefined,
   };
 
-  // [OpenRouter, 2025-01-24]
-  if (hotFixVndORIncludeReasoning)
-    payload.include_reasoning = true;
-
   // Top-P instead of temperature
   if (model.topP !== undefined) {
     delete payload.temperature;
@@ -121,14 +119,19 @@ export function aixToOpenAIChatCompletions(openAIDialect: OpenAIDialects, model:
   if (model.vndOaiReasoningEffort) {
     payload.reasoning_effort = model.vndOaiReasoningEffort;
   }
-  // [OpenAI] Vendor-specific restore markdown, for newer o1 models
-  if (model.vndOaiRestoreMarkdown) {
-    _fixVndOaiRestoreMarkdown_Inline(payload);
-  }
+
+  // --- Tools ---
+
+  // Allow/deny auto-adding hosted tools when custom tools are present
+  const hasCustomTools = chatGenerate.tools?.some(t => t.type === 'function_call');
+  const hasRestrictivePolicy = chatGenerate.toolsPolicy?.type === 'any' || chatGenerate.toolsPolicy?.type === 'function_call';
+  const skipWebSearchDueToCustomTools = hasCustomTools && hasRestrictivePolicy;
+
+  // Hosted tools
   // [OpenAI] Vendor-specific web search context and/or geolocation
   // NOTE: OpenAI doesn't support web search with minimal reasoning effort
   const skipWebSearchDueToMinimalReasoning = model.vndOaiReasoningEffort === 'minimal';
-  if ((model.vndOaiWebSearchContext || model.userGeolocation) && !skipWebSearchDueToMinimalReasoning) {
+  if ((model.vndOaiWebSearchContext || model.userGeolocation) && !skipWebSearchDueToMinimalReasoning && !skipWebSearchDueToCustomTools) {
     payload.web_search_options = {};
     if (model.vndOaiWebSearchContext)
       payload.web_search_options.search_context_size = model.vndOaiWebSearchContext;
@@ -140,6 +143,22 @@ export function aixToOpenAIChatCompletions(openAIDialect: OpenAIDialects, model:
         },
       };
   }
+
+
+  // [OpenAI] Vendor-specific restore markdown, for newer o1 models
+  const skipMarkdownDueToCustomTools = hasCustomTools && hasRestrictivePolicy;
+  if (model.vndOaiRestoreMarkdown && !skipMarkdownDueToCustomTools)
+    _fixVndOaiRestoreMarkdown_Inline(payload);
+
+
+  // [OpenRouter] Vendor-specific web search (native or Exa)
+  if (openAIDialect === 'openrouter' && model.vndOrtWebSearch === 'auto')
+    payload.plugins = [...(payload.plugins || []), {
+      id: 'web',
+      // engine is optional - when undefined, OpenRouter uses native for supported models, falls back to Exa
+      // max_results: 5, // could be configurable in the future
+      // search_prompt: undefined, // could be configurable in the future
+    }];
 
   // [xAI] Vendor-specific extensions for Live Search
   if (openAIDialect === 'xai' && model.vndXaiSearchMode && model.vndXaiSearchMode !== 'off') {
@@ -156,7 +175,7 @@ export function aixToOpenAIChatCompletions(openAIDialect: OpenAIDialects, model:
         .split(',')
         .map(s => s.trim())
         .filter(s => !!s);
-      
+
       // only omit sources if it's the default ('web' and 'x')
       const isDefaultSources = sources.length === 2 && sources.includes('web') && sources.includes('x');
       if (!isDefaultSources)
@@ -171,6 +190,15 @@ export function aixToOpenAIChatCompletions(openAIDialect: OpenAIDialects, model:
 
     payload.search_parameters = search_parameters;
   }
+
+  // [Moonshot] Kimi's $web_search builtin function
+  if (openAIDialect === 'moonshot' && model.vndMoonshotWebSearch === 'auto' && !skipWebSearchDueToCustomTools)
+    payload.tools = [...(payload.tools || []), {
+      type: 'builtin_function',
+      function: {
+        name: '$web_search',
+      },
+    }];
 
   // [Perplexity] Vendor-specific extensions for search models
   if (openAIDialect === 'perplexity') {
@@ -191,20 +219,35 @@ export function aixToOpenAIChatCompletions(openAIDialect: OpenAIDialects, model:
     }
   }
 
-  // [OpenRouter] -> [Anthropic] via OpenAI API - https://openrouter.ai/docs/use-cases/reasoning-tokens
-  if (openAIDialect === 'openrouter' && model.vndAntThinkingBudget !== undefined) {
+  // [OpenRouter, 2025-11-11] Unified reasoning parameter - supports both token-based and effort-based control
+  if (openAIDialect === 'openrouter') {
 
-    // vndAntThinkingBudget's presence indicates a user preference:
-    // - [x] a number, which is the budget in tokens
-    // - [ ] null: shall disable thinking, but openrouter does not support this?
-    if (model.vndAntThinkingBudget === null) {
-      // simply not setting the reasoning field downgrades this to a non-thinking model
-      // console.warn('OpenRouter does not support disabling thinking of Anthropic models. Using default.');
-    } else {
-      payload.reasoning = {
-        max_tokens: model.vndAntThinkingBudget || 1024,
-      };
+    // Anthropic via OpenRouter
+    if (model.vndAntThinkingBudget !== undefined) {
+      // vndAntThinkingBudget's presence indicates a user preference:
+      // - a number: explicit token budget (1024-32000)
+      // - null: disable thinking (don't set reasoning field)
+      if (model.vndAntThinkingBudget === null) {
+        // If null, don't set reasoning field at all (disables thinking)
+      } else
+        payload.reasoning = { max_tokens: model.vndAntThinkingBudget || 8192 };
     }
+    // Gemini via OpenRouter
+    else if (model.vndGeminiThinkingBudget !== undefined)
+      payload.reasoning = { max_tokens: model.vndGeminiThinkingBudget || 8192 };
+    // OpenAI via OpenRouter
+    else if (model.vndOaiReasoningEffort && model.vndOaiReasoningEffort !== 'minimal')
+      payload.reasoning = { effort: model.vndOaiReasoningEffort };
+
+    // FIX double-reasoning request - remove reasoning_effort after transferring it to reasoning (unless already set)
+    if (payload.reasoning_effort && payload.reasoning_effort !== 'minimal') {
+      // we don't know which one takes precedence, so we prioritize .reasoning (OpenRouter) even if .reasoning_effort (OpenAI) is present
+      if (!payload.reasoning)
+        payload.reasoning = { effort: payload.reasoning_effort };
+      // Fix for `Only one of "reasoning" and "reasoning_effort" may be provided`
+      delete payload.reasoning_effort;
+    }
+
   }
 
   if (hotFixOpenAIOFamily)
@@ -212,6 +255,7 @@ export function aixToOpenAIChatCompletions(openAIDialect: OpenAIDialects, model:
 
   if (hotFixRemoveStreamOptions)
     payload = _fixRemoveStreamOptions(payload);
+
 
   // Preemptive error detection with server-side payload validation before sending it upstream
   const validated = OpenAIWire_API_Chat_Completions.Request_schema.safeParse(payload);

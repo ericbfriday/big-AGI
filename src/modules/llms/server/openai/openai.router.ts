@@ -3,7 +3,7 @@ import { TRPCError } from '@trpc/server';
 
 import { createTRPCRouter, publicProcedure } from '~/server/trpc/trpc.server';
 import { env } from '~/server/env';
-import { fetchJsonOrTRPCThrow } from '~/server/trpc/trpc.router.fetchers';
+import { fetchJsonOrTRPCThrow, TRPCFetcherError } from '~/server/trpc/trpc.router.fetchers';
 import { serverCapitalizeFirstLetter } from '~/server/wire';
 
 import type { T2ICreateImageAsyncStreamOp } from '~/modules/t2i/t2i.server';
@@ -14,7 +14,7 @@ import { Brand } from '~/common/app.config';
 import { OpenAIWire_API_Images_Generations, OpenAIWire_API_Models_List, OpenAIWire_API_Moderations_Create } from '~/modules/aix/server/dispatch/wiretypes/openai.wiretypes';
 
 import { ListModelsResponse_schema, ModelDescriptionSchema, RequestAccessValues } from '../llm.server.types';
-import { alibabaModelSort, alibabaModelToModelDescription } from './models/alibaba.models';
+import { alibabaModelFilter, alibabaModelSort, alibabaModelToModelDescription } from './models/alibaba.models';
 import { azureDeploymentFilter, azureDeploymentToModelDescription, azureOpenAIAccess, azureParseFromDeploymentsAPI } from './models/azure.models';
 import { chutesAIHeuristic, chutesAIModelsToModelDescriptions } from './models/chutesai.models';
 import { deepseekModelFilter, deepseekModelSort, deepseekModelToModelDescription } from './models/deepseek.models';
@@ -23,7 +23,8 @@ import { fireworksAIHeuristic, fireworksAIModelsToModelDescriptions } from './mo
 import { groqModelFilter, groqModelSortFn, groqModelToModelDescription } from './models/groq.models';
 import { lmStudioModelToModelDescription, localAIModelSortFn, localAIModelToModelDescription } from './models/models.data';
 import { mistralModels } from './models/mistral.models';
-import { openAIModelFilter, openAIModelToModelDescription, openaiDevCheckForModelsOverlap_DEV, openAISortModels } from './models/openai.models';
+import { moonshotModelFilter, moonshotModelSortFn, moonshotModelToModelDescription } from './models/moonshot.models';
+import { openaiDevCheckForModelsOverlap_DEV, openAIInjectVariants, openAIModelFilter, openAIModelToModelDescription, openAISortModels } from './models/openai.models';
 import { openPipeModelDescriptions, openPipeModelSort, openPipeModelToModelDescriptions } from './models/openpipe.models';
 import { openRouterInjectVariants, openRouterModelFamilySortFn, openRouterModelToModelDescription } from './models/openrouter.models';
 import { perplexityAIModelDescriptions, perplexityInjectVariants } from './models/perplexity.models';
@@ -33,7 +34,7 @@ import { xaiModelDescriptions, xaiModelSort } from './models/xai.models';
 
 
 const openAIDialects = z.enum([
-  'alibaba', 'azure', 'deepseek', 'groq', 'lmstudio', 'localai', 'mistral', 'openai', 'openpipe', 'openrouter', 'perplexity', 'togetherai', 'xai',
+  'alibaba', 'azure', 'deepseek', 'groq', 'lmstudio', 'localai', 'mistral', 'moonshot', 'openai', 'openpipe', 'openrouter', 'perplexity', 'togetherai', 'xai',
 ]);
 export type OpenAIDialects = z.infer<typeof openAIDialects>;
 
@@ -88,9 +89,9 @@ const _createImageConfigBase = z.object({
   user: z.string().optional(),
 });
 
-// GPT Image
+// GPT Image family (gpt-image-1, gpt-image-1-mini share all parameters)
 const createImageConfigGI = _createImageConfigBase.extend({
-  model: z.literal('gpt-image-1'),
+  model: z.enum(['gpt-image-1', 'gpt-image-1-mini']),
   prompt: z.string().max(32000),
   size: z.enum([/*'auto',*/ '1024x1024', '1536x1024', '1024x1536']),
   quality: z.enum(['high', 'medium', 'low']).optional(),
@@ -124,7 +125,7 @@ const createImagesInputSchema = z.object({
   access: openAIAccessSchema,
   // for this object sync with <> OpenAIWire_API_Images_Generations.Request_schema
   generationConfig: z.discriminatedUnion('model', [
-    createImageConfigGI,
+    createImageConfigGI, // handles both gpt-image-1 and gpt-image-1-mini
     createImageConfigD3,
     createImageConfigD2,
   ]),
@@ -159,7 +160,25 @@ export const llmOpenAIRouter = createTRPCRouter({
   listModels: publicProcedure
     .input(listModelsInputSchema)
     .output(ListModelsResponse_schema)
-    .query(async ({ input: { access } }): Promise<{ models: ModelDescriptionSchema[] }> => {
+
+    // tRPC middleware: log errors for this procedure - as we don't have proper try/catch blocks yet
+    .use(async ({ next, path, signal, type, input }) => {
+      const result = await next();
+
+      // [PROD] log/warn listModel errors
+      if (!result.ok && result.error) {
+        // '401 unauthorized' is expected with wrong/missing API keys - log instead of warn
+        const is401 = result.error instanceof TRPCFetcherError && result.error.httpStatus === 401;
+        const isLocalAI = input.access?.dialect === 'localai';
+        console[(is401 || isLocalAI) ? 'log' : 'warn'](`${path} (${input.access?.dialect || '?'}):${signal?.aborted ? ' [ABORTED]' : ''}`, result.error);
+      }
+
+      // [DEV] NOTE: the trpc onError will also log next when in development mode, @see handlerEdgeRoutes
+
+      return result;
+    })
+
+    .query(async ({ input: { access }, signal }): Promise<{ models: ModelDescriptionSchema[] }> => {
 
       let models: ModelDescriptionSchema[];
 
@@ -175,7 +194,7 @@ export const llmOpenAIRouter = createTRPCRouter({
         return { models: (await xaiModelDescriptions(access)).sort(xaiModelSort) };
 
       // [OpenAI-dialects]: fetch openAI-style for all but Azure (will be then used in each dialect)
-      const openAIWireModelsResponse = await openaiGETOrThrow<OpenAIWire_API_Models_List.Response>(access, '/v1/models');
+      const openAIWireModelsResponse = await openaiGETOrThrow<OpenAIWire_API_Models_List.Response>(access, '/v1/models', signal);
 
       // [Together] missing the .data property
       if (access.dialect === 'togetherai')
@@ -197,6 +216,7 @@ export const llmOpenAIRouter = createTRPCRouter({
 
         case 'alibaba':
           models = openAIModels
+            .filter(({ id }) => alibabaModelFilter(id))
             .map(({ id, created }) => alibabaModelToModelDescription(id, created))
             .sort(alibabaModelSort);
           break;
@@ -239,6 +259,13 @@ export const llmOpenAIRouter = createTRPCRouter({
           models = mistralModels(openAIModels);
           break;
 
+        case 'moonshot':
+          models = openAIModels
+            .filter(moonshotModelFilter)
+            .map(moonshotModelToModelDescription)
+            .sort(moonshotModelSortFn);
+          break;
+
         // [OpenAI]: chat-only models, custom sort, manual mapping
         case 'openai':
 
@@ -261,6 +288,9 @@ export const llmOpenAIRouter = createTRPCRouter({
 
             // to model description
             .map((model): ModelDescriptionSchema => openAIModelToModelDescription(model.id, model.created))
+
+            // inject variants
+            .reduce(openAIInjectVariants, [] as ModelDescriptionSchema[])
 
             // custom OpenAI sort
             .sort(openAISortModels);
@@ -299,10 +329,11 @@ export const llmOpenAIRouter = createTRPCRouter({
       const { access, generationConfig: config, editConfig } = input;
 
       // Determine if this is an edit request
-      const isEdit = !!editConfig?.inputImages?.length && config.model === 'gpt-image-1';
+      const isGptImageFamily = config.model === 'gpt-image-1' || config.model === 'gpt-image-1-mini';
+      const isEdit = !!editConfig?.inputImages?.length && isGptImageFamily;
 
       // validate input
-      if (isEdit && config.model !== 'gpt-image-1')
+      if (isEdit && !isGptImageFamily)
         throw new TRPCError({ code: 'BAD_REQUEST', message: `Image editing is only supported for GPT Image models` });
       if (config.model === 'dall-e-3' && config.count > 1)
         throw new TRPCError({ code: 'BAD_REQUEST', message: `[OpenAI Issue] dall-e-3 model does not support more than 1 image` });
@@ -380,18 +411,18 @@ export const llmOpenAIRouter = createTRPCRouter({
           isEdit ? '/v1/images/edits' : '/v1/images/generations',
           signal, // wire the signal from the input
         )
-        .catch((error: any) => {
-          // if aborted, ignore the error, or else we'll throw an error
-          if (signal?.aborted)
-            return null; // de-facto ignores the error, and the connection is already gone
+          .catch((error: any) => {
+            // if aborted, ignore the error, or else we'll throw an error
+            if (signal?.aborted)
+              return null; // de-facto ignores the error, and the connection is already gone
 
-          // otherwise, re-throw the error
-          throw new TRPCError({
-            code: 'BAD_REQUEST',
-            message: `Error: ${error?.message || error?.toString() || 'Unknown error'}`,
-            cause: error,
-          });
-        }),
+            // otherwise, re-throw the error
+            throw new TRPCError({
+              code: 'BAD_REQUEST',
+              message: `Error: ${error?.message || error?.toString() || 'Unknown error'}`,
+              cause: error,
+            });
+          }),
       );
 
       // null: there was an error
@@ -498,6 +529,7 @@ const DEFAULT_DEEPSEEK_HOST = 'https://api.deepseek.com';
 const DEFAULT_GROQ_HOST = 'https://api.groq.com/openai';
 const DEFAULT_LOCALAI_HOST = 'http://127.0.0.1:8080';
 const DEFAULT_MISTRAL_HOST = 'https://api.mistral.ai';
+const DEFAULT_MOONSHOT_HOST = 'https://api.moonshot.ai';
 const DEFAULT_OPENAI_HOST = 'api.openai.com';
 const DEFAULT_OPENPIPE_HOST = 'https://app.openpipe.ai/api';
 const DEFAULT_OPENROUTER_HOST = 'https://openrouter.ai/api';
@@ -537,7 +569,7 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       alibabaOaiKey = getRandomKeyFromMultiKey(alibabaOaiKey);
 
       if (!alibabaOaiKey || !alibabaOaiHost)
-        throw new Error('Missing Alibaba API Key. Add it on the UI or server side (your deployment).');
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing Alibaba API Key. Add it on the UI or server side (your deployment).' });
 
       return {
         headers: {
@@ -562,7 +594,7 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       deepseekKey = getRandomKeyFromMultiKey(deepseekKey);
 
       if (!deepseekKey || !deepseekHost)
-        throw new Error('Missing Deepseek API Key or Host. Add it on the UI (Models Setup) or server side (your deployment).');
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing Deepseek API Key or Host. Add it on the UI (Models Setup) or server side (your deployment).' });
 
       return {
         headers: {
@@ -580,7 +612,7 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       let oaiHost = fixupHost(access.oaiHost || env.OPENAI_API_HOST || DEFAULT_OPENAI_HOST, apiPath);
       // warn if no key - only for default (non-overridden) hosts
       if (!oaiKey && oaiHost.indexOf(DEFAULT_OPENAI_HOST) !== -1)
-        throw new Error('Missing OpenAI API Key. Add it on the UI or server side (your deployment).');
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing OpenAI API Key. Add it on the UI or server side (your deployment).' });
 
       // [Helicone]
       // We don't change the host (as we do on Anthropic's), as we expect the user to have a custom host.
@@ -602,11 +634,11 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
 
         // The expected path should be: /v1/<ACCOUNT_TAG>/<GATEWAY_URL_SLUG>/<PROVIDER_ENDPOINT>
         if (pathSegments.length < 3 || pathSegments.length > 4 || pathSegments[0] !== 'v1')
-          throw new Error('Cloudflare AI Gateway API Host is not valid. Please check the API Host field in the Models Setup page.');
+          throw new TRPCError({ code: 'BAD_REQUEST', message: 'Cloudflare AI Gateway API Host is not valid. Please check the API Host field in the Models Setup page.' });
 
         const [_v1, accountTag, gatewayName, provider] = pathSegments;
         if (provider && provider !== 'openai')
-          throw new Error('Cloudflare AI Gateway only supports OpenAI as a provider.');
+          throw new TRPCError({ code: 'BAD_REQUEST', message: 'Cloudflare AI Gateway only supports OpenAI as a provider.' });
 
         if (apiPath.startsWith('/v1'))
           apiPath = apiPath.replace('/v1', '');
@@ -633,7 +665,7 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       groqKey = getRandomKeyFromMultiKey(groqKey);
 
       if (!groqKey)
-        throw new Error('Missing Groq API Key. Add it on the UI (Models Setup) or server side (your deployment).');
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing Groq API Key. Add it on the UI (Models Setup) or server side (your deployment).' });
 
       return {
         headers: {
@@ -674,11 +706,30 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
         url: mistralHost + apiPath,
       };
 
+    case 'moonshot':
+      // https://platform.moonshot.ai/docs/api/chat
+      let moonshotKey = access.oaiKey || env.MOONSHOT_API_KEY || '';
+      const moonshotHost = fixupHost(access.oaiHost || DEFAULT_MOONSHOT_HOST, apiPath);
+
+      // Use function to select a random key if multiple keys are provided
+      moonshotKey = getRandomKeyFromMultiKey(moonshotKey);
+
+      if (!moonshotKey || !moonshotHost)
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing Moonshot API Key or Host. Add it on the UI or server side.' });
+
+      return {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${moonshotKey}`,
+        },
+        url: moonshotHost + apiPath,
+      };
+
 
     case 'openpipe':
       const openPipeKey = access.oaiKey || env.OPENPIPE_API_KEY || '';
       if (!openPipeKey)
-        throw new Error('Missing OpenPipe API Key or Host. Add it on the UI or server side (your deployment).');
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing OpenPipe API Key or Host. Add it on the UI or server side (your deployment).' });
 
       return {
         headers: {
@@ -698,7 +749,7 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       orKey = getRandomKeyFromMultiKey(orKey);
 
       if (!orKey || !orHost)
-        throw new Error('Missing OpenRouter API Key or Host. Add it on the UI or server side (your deployment).');
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing OpenRouter API Key or Host. Add it on the UI or server side (your deployment).' });
 
       return {
         headers: {
@@ -718,7 +769,7 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       perplexityKey = getRandomKeyFromMultiKey(perplexityKey);
 
       if (!perplexityKey || !perplexityHost)
-        throw new Error('Missing Perplexity API Key or Host. Add it on the UI (Models Setup) or server side (your deployment).');
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing Perplexity API Key or Host. Add it on the UI (Models Setup) or server side (your deployment).' });
 
       if (apiPath.startsWith('/v1'))
         apiPath = apiPath.replace('/v1', '');
@@ -741,7 +792,7 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       togetherKey = getRandomKeyFromMultiKey(togetherKey);
 
       if (!togetherKey || !togetherHost)
-        throw new Error('Missing TogetherAI API Key or Host. Add it on the UI (Models Setup) or server side (your deployment).');
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing TogetherAI API Key or Host. Add it on the UI (Models Setup) or server side (your deployment).' });
 
       return {
         headers: {
@@ -760,7 +811,8 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
       xaiKey = getRandomKeyFromMultiKey(xaiKey);
 
       if (!xaiKey)
-        throw new Error('Missing xAI API Key. Add it on the UI (Models Setup) or server side (your deployment).');
+        throw new TRPCError({ code: 'BAD_REQUEST', message: 'Missing xAI API Key. Add it on the UI (Models Setup) or server side (your deployment).' });
+
       return {
         headers: {
           'Content-Type': 'application/json',
@@ -773,9 +825,9 @@ export function openAIAccess(access: OpenAIAccessSchema, modelRefId: string | nu
 }
 
 
-async function openaiGETOrThrow<TOut extends object>(access: OpenAIAccessSchema, apiPath: string /*, signal?: AbortSignal*/): Promise<TOut> {
+async function openaiGETOrThrow<TOut extends object>(access: OpenAIAccessSchema, apiPath: string, signal: undefined | AbortSignal = undefined): Promise<TOut> {
   const { headers, url } = openAIAccess(access, null, apiPath);
-  return await fetchJsonOrTRPCThrow<TOut>({ url, headers, name: `OpenAI/${serverCapitalizeFirstLetter(access.dialect)}` });
+  return await fetchJsonOrTRPCThrow<TOut>({ url, headers, name: `OpenAI/${serverCapitalizeFirstLetter(access.dialect)}`, signal });
 }
 
 async function openaiPOSTOrThrow<TOut extends object, TPostBody extends object | FormData>(access: OpenAIAccessSchema, modelRefId: string | null, body: TPostBody, apiPath: string, signal: undefined | AbortSignal = undefined): Promise<TOut> {

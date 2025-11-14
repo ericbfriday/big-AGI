@@ -2,6 +2,13 @@
 import { createEnv } from '../modules/3rdparty/t3-env';
 import * as z from 'zod/v4';
 
+
+// Helper to make some variables required only in production
+const isProd = process.env.NODE_ENV === 'production' // True on Vercel and local builds, false on local dev
+  && process.env.NEXT_PUBLIC_VERCEL_TARGET_ENV !== 'preview'; // False on Vercel dev-branch builds ('production' and 'staging' environments are treated as prod)
+const requireOnProd = isProd ? z.string() : z.string().optional();
+
+
 export const env = createEnv({
 
   /*
@@ -53,6 +60,9 @@ export const env = createEnv({
 
     // LLM: Mistral
     MISTRAL_API_KEY: z.string().optional(),
+
+    // LLM: Moonshot AI
+    MOONSHOT_API_KEY: z.string().optional(),
 
     // LLM: Ollama
     OLLAMA_API_HOST: z.url().optional(),
