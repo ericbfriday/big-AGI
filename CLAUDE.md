@@ -1,249 +1,214 @@
 # CLAUDE.md
 
-Guidance to Claude Code when working with code in this repository.
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Development Commands
+
+```bash
+# Development
+npm run dev                           # Start dev server (Next.js + Turbopack)
+npm run build                         # Production build
+npm run start                         # Start production server
+
+# Code Quality (safe while dev server runs)
+npx tsc --noEmit                      # Type check without building
+npx eslint src/path/to/file.ts        # Lint specific file
+npm run lint                          # Lint entire project
+
+# Database (requires POSTGRES_PRISMA_URL)
+npm run db:push                       # Push Prisma schema to database
+npm run db:studio                     # Open Prisma Studio GUI
+```
 
 ## Architecture Overview
 
-Big-AGI is a Next.js 15 application with a sophisticated modular architecture built for professional AI interactions.
-
-### Development Commands
-
-Dev servers may be already running on ports 3000, 3001, 3002, or 3003 (not always this app - other projects may occupy these ports). Never start or stop dev servers, let the user do it.
-
-```bash
-# Validate (~5s, safe while dev server runs, do NOT use `next build` ~45s for same checks)
-tsc --noEmit --pretty && npm run lint # Type check (~3.5s) + ESLint (~2s)
-eslint src/path/to/file.ts           # Lint specific file
-
-# Full build (~60s+, only when suspecting runtime/bundle issues)
-npm run build  # next build runs compile+lint+types but stops at first type-error file; tsc shows all at once
-
-# Database & External Services
-# npm run supabase:local-update-types   # Generate TypeScript types
-# npm run stripe:listen                 # Listen for Stripe webhooks
-```
-
-### Git/GitHub remotes
-
-The `gh` command is available to interact with GitHub from the terminal, but **NEVER PUSH TO ANY BRANCH**. The user manages all 'write' git operations.
-- `opensource` -> `enricoros/big-AGI` (public, default branch: `main`, MIT) - community issues/PRs/releases
-- `private` -> `big-agi/big-agi-private` (private, default branch: `dev`) - main dev repo with `dev`->`staging`->`prod` pipeline
-- **Always use `git mv` instead of `mv`** when renaming or moving files - preserves git history tracking
-- **NEVER run `git stash`** - it causes work loss
-
-**Branch contents:**
-- `main` is the open-source build: local-first, BYO-keys, full AIX and provider coverage
-- `dev` extends `main` with the hosted/cloud layer: auth, Zync sync, Cloud Fabric, Stripe, multi-tenant, admin pages, it's the way to go for users, the best user experience of any multi-model chat application
-- Cloud/auth/sync code stays on `dev`; non-cloud improvements (UX, AIX, model support, bug fixes) can land on either branch
-
-**Branch workflow:**
-- `dev` is rebased on top of `main` (never merged) - `main` changes flow into `dev` on the next rebase, no manual forward-port needed
-- Never `git merge` between the two branches - breaks the linear topology
-- Backporting `dev` -> `main` is a re-implementation, never a cherry-pick - keep `main`-side edits minimal/additive so the existing `dev` version lands cleanly on rebase; split into small commits when natural
+Big-AGI is a Next.js 15 application with a modular architecture for advanced AI interactions. The codebase follows a three-layer structure with distinct separation of concerns.
 
 ### Core Directory Structure
 
-You are started from the root of the repository (i.e. where the git folder is or scripts should be run from).
-**ISSUE ALL COMMANDS FROM THE ROOT, OMITTING 'cd' COMMANDS. DO NOT CHAIN CD AND OTHER COMMANDS**
-**NEVER RUN COMPOUND `cd` COMMANDS LIKE `cd some-folder && command` - ONLY RUN `command` FROM THE ROOT, ALWAYS.**
-The directory structure is as follows:
-
 ```
-/app/api/          # Next.js App Router (API routes only, mostly -> /src/server/)
-/pages/            # Next.js Pages Router (file-based, mostly -> /src/apps/)
-/src/
-├── apps/          # Feature applications (self-contained modules)
-├── modules/       # Reusable business logic and integrations
-├── common/        # Shared infrastructure and utilities
-└── server/        # Backend API layer with tRPC
-/kb/               # Knowledge base for modules, architectures
+app/api/               # Next.js App Router (API routes only)
+  edge/[trpc]/         #   Edge runtime tRPC endpoint
+  cloud/[trpc]/        #   Node.js runtime tRPC endpoint
+pages/                 # Next.js Pages Router (file-based routing -> src/apps/)
+src/
+  apps/                # Feature applications (self-contained modules)
+  modules/             # Reusable business logic and integrations
+  common/              # Shared infrastructure, stores, layout, utilities
+  server/              # Backend: tRPC routers, Prisma, environment config
+kb/                    # Knowledge base documentation (see @kb/KB.md)
+tools/                 # Development tooling and scripts
 ```
 
 ### Key Technologies
 
-- **Frontend**: Next.js 15, React 18, Material-UI Joy, Emotion (CSS-in-JS)
-- **State Management**: Zustand with localStorage/IndexedDB (single cell) persistence
-- **API Layer**: tRPC with TanStack React Query for type-safe communication
-- **Runtime**: Edge Runtime for AI operations, Node.js for data processing
+- **Frontend**: Next.js 15, React 18, MUI Joy (beta), Emotion CSS-in-JS
+- **State Management**: Zustand 5 with localStorage/IndexedDB persistence
+- **API Layer**: tRPC 11 with React Query for type-safe client-server communication
+- **Database**: Prisma 5 with PostgreSQL (optional, for link sharing)
+- **Validation**: Zod 4 for runtime schema validation
+- **Runtime**: Edge Runtime for AI streaming, Node.js for data processing
+- **Analytics**: PostHog (optional)
 
-### "Apps" Architecture Pattern
+### Path Aliases (tsconfig)
 
-Each app in `/src/apps/` is a self-contained feature module:
-- Main component (`App*.tsx`)
-- Local state store (`store-app-*.ts`)
-- Feature-specific components and layouts
-- Runtime configurations
+```
+~/common/*  -> src/common/*
+~/modules/* -> src/modules/*
+~/server/*  -> src/server/*
+```
 
-Example apps: `chat/`, `call/`, `beam/`, `draw/`, `personas/`, `settings-modal/`
+## Apps (`src/apps/`)
 
-### Modules Architecture Pattern
+Each app is a self-contained feature module with a main `App*.tsx` component. Some have local state stores (`store-app-*.ts`).
 
-Modules in `/src/modules/` provide reusable business logic:
-- **`aix/`** - AI communication framework for real-time streaming
-- **`beam/`** - Multi-model AI reasoning system (scatter/gather pattern)
-- **`blocks/`** - Content rendering (markdown, code, images, etc.)
-- **`llms/`** - Language model abstraction supporting 20+ vendors
+**Apps**: `beam/`, `call/`, `chat/`, `diff/`, `draw/`, `link-chat/`, `news/`, `personas/`, `settings-modal/`, `tokens/`
 
-### Key Subsystems & Their Patterns
+Pages in `/pages/` map to these apps (e.g., `pages/index.tsx` -> `AppChat`, `pages/draw.tsx` -> `AppDraw`).
 
-#### AIX - Real-time AI Communication
-**Location**: `/src/modules/aix/`
-**Pattern**: Client-server streaming architecture with provider abstraction
+## Modules (`src/modules/`)
 
+Modules provide reusable business logic and integrations:
+
+| Module | Purpose |
+|--------|---------|
+| `aix/` | AI communication framework - streaming, provider abstraction |
+| `beam/` | Multi-model reasoning (scatter/gather pattern) |
+| `blocks/` | Content rendering (markdown, code, images, etc.) |
+| `llms/` | Language model abstraction - 17 vendor integrations |
+| `aifn/` | AI functions (code fixup, image captioning, follow-ups) |
+| `browse/` | Web scraping and content extraction |
+| `dblobs/` | Binary large object storage |
+| `elevenlabs/` | Text-to-speech integration |
+| `google/` | Google Search integration |
+| `persona/` | Persona/character system |
+| `t2i/` | Text-to-image generation |
+| `trade/` | Import/export (ChatGPT, markdown, JSON) |
+| `youtube/` | YouTube transcript extraction |
+| `3rdparty/` | Third-party integrations |
+| `backend/` | Backend utility services |
+
+## Key Subsystems
+
+### AIX - AI Communication (`src/modules/aix/`)
+
+Client-server streaming architecture with provider abstraction:
 - **Client** -> tRPC -> **Server** -> **AI Providers**
-- Handles streaming/non-streaming responses with batching and error recovery
 - Particle-based streaming: `AixWire_Particles` -> `ContentReassembler` -> `DMessage`
 - Provider-agnostic through adapter pattern (OpenAI, Anthropic, Gemini protocols)
+- Primary entry: `aixChatGenerateContent_DMessage()` in `aix.client.ts`
 
-#### Beam - Multi-Model Reasoning
-**Location**: `/src/modules/beam/`
-**Pattern**: Scatter/Gather for parallel AI processing
+### Beam - Multi-Model Reasoning (`src/modules/beam/`)
 
+Scatter/Gather pattern for parallel AI processing:
 - **Scatter**: Multiple models (rays) process input in parallel
 - **Gather**: Fusion algorithms combine outputs
-- Real-time UI updates via vanilla Zustand stores
-- BeamStore per conversation via ConversationHandler
+- State managed via `store-beam_vanilla.ts` (vanilla Zustand, no React integration)
+- BeamStore per conversation via `ConversationHandler`
 
-#### Conversation Management
-**Location**: `/src/common/stores/chat/` and `/src/common/chat-overlay/`
-**Pattern**: Overlay architecture with handler per conversation
+### Conversation Management
 
-- `ConversationHandler` orchestrates chat, beam, ephemerals
-- Per-chat stores: `PerChatOverlayStore` + `BeamStore`
-- Message structure: `DMessage` -> `DMessageFragment[]`
-- Supports multi-pane with independent conversation states
+- **`ConversationHandler`** (`src/common/chat-overlay/ConversationHandler.ts`): Singleton per conversation, orchestrates chat, beam, and ephemerals
+- **Per-chat stores**: `store-perchat_vanilla.ts` with slices for composer, ephemerals, variform
+- **Message structure**: `DMessage` -> `DMessageFragment[]`
+- **Multi-pane support** with independent conversation states
 
-#### Layout System ("Optima")
+### LLM Vendor System (`src/modules/llms/`)
 
-The Optima layout system provides:
-- **Responsive design** adapting desktop/mobile
-- **Drawer(left)/Toolbar/Panel(right)** composition
-- **Portal-based rendering** for flexible component placement
+17 vendors registered in `vendors.registry.ts`:
+`alibaba`, `anthropic`, `azure`, `deepseek`, `googleai` (Gemini), `groq`, `lmstudio`, `localai`, `mistral`, `moonshot`, `ollama`, `openai`, `openpipe`, `openrouter`, `perplexity`, `togetherai`, `xai`
 
-Located in `/src/common/layout/optima/`
+Each vendor implements the `IModelVendor` interface (`IModelVendor.ts`).
 
-### Storage System
+## State Management
 
-Big-AGI uses a local-first architecture with Zustand + IndexedDB:
-- **Zustand** stores for in-memory state management
-- **localStorage** for persistent settings/all storage (via Zustand persist middleware)
-- **IndexedDB** for persistent chat-only storage (via Zustand persist middleware) on a single key-val cell
-- **Local-first** architecture with offline capability
+### Global Stores (`src/common/stores/`)
 
-Key storage patterns:
-- Stores use `createIDBPersistStorage()` for IndexedDB persistence
+| Store | Persistence | Purpose |
+|-------|------------|---------|
+| `chat/store-chats.ts` | IndexedDB | Conversations and messages |
+| `llms/store-llms.ts` | localStorage | Model configurations |
+| `store-ux-labs.ts` | localStorage | UI preferences and labs features |
+| `store-ui.ts` | localStorage | General UI state |
+| `store-client.ts` | localStorage | Client configuration |
+| `folders/store-chat-folders.ts` | localStorage | Chat folder organization |
+| `metrics/store-metrics.ts` | localStorage | Usage metrics |
+| `workspace/store-client-workspace.ts` | localStorage | Workspace state |
+
+### Per-Instance Stores (Vanilla Zustand)
+
+- `store-beam_vanilla.ts`: Beam scatter/gather state (high-performance, no React)
+- `store-perchat_vanilla.ts`: Chat overlay state with composer/ephemeral/variform slices
+
+### Storage Patterns
+
+- Stores use `createIDBPersistStorage()` for IndexedDB persistence (`src/common/util/idbUtils.ts`)
 - Version-based migrations handle data structure changes
 - Partialize/merge functions control what gets persisted
 - Rehydration logic repairs and upgrades data on load
 
-Located in `/src/common/stores/` with stores like:
-- `chat/store-chats.ts`: Conversations and messages
-- `llms/store-llms.ts`: Model configurations
+## Layout System ("Optima") (`src/common/layout/optima/`)
 
-### State Management Patterns
+Responsive layout composition system:
+- `OptimaLayout.tsx` - Main layout with desktop/mobile adaptation
+- `bar/` - Top bar with dropdown
+- `nav/` - Desktop/mobile navigation
+- `drawer/` - Side drawer (conversation list)
+- `panel/` - Side panel (settings, details)
+- `portals/` - React portal management for flexible component placement
+- `overlays/` - Modal/overlay system
+- `scratchclip/` - Clipboard features
 
-1. **Global Stores** (Zustand with IndexedDB persistence)
-   - `store-chats`: Conversations and messages
-   - `store-llms`: Model configurations
-   - `store-ux-labs`: UI preferences and labs features
-   - **Zustand pattern**: Always wrap multi-property selectors with `useShallow` from `zustand/react/shallow` to prevent re-renders on reference changes
+## Server Architecture (`src/server/`)
 
-2. **Per-Instance Stores** (Vanilla Zustand)
-   - `store-beam_vanilla`: Beam scatter/gather state
-   - `store-perchat_vanilla`: Chat overlay state
-   - `store-attachment-drafts_vanilla`: Attachment drafts
-   - High-performance, no React integration
+Split architecture with two tRPC routers:
 
-3. **Module Stores**
-   - Feature-specific configuration and state
-   - Example: `store-module-beam`, `store-module-t2i`
+### Edge Runtime (`trpc.router-edge.ts`)
+Low-latency AI operations at `/api/edge`:
+- `aixRouter` - AI streaming and communication
+- `llmAnthropicRouter`, `llmGeminiRouter`, `llmOllamaRouter`, `llmOpenAIRouter` - Vendor integrations
+- `elevenlabsRouter`, `googleSearchRouter`, `youtubeRouter` - External services
+- `backendRouter` - Backend services
 
-### User Flows & Interdependencies
+### Cloud Runtime (`trpc.router-cloud.ts`)
+Node.js data processing at `/api/cloud`:
+- `browseRouter` - Web scraping (Puppeteer-based)
+- `tradeRouter` - Import/export functionality
 
-#### Chat Message Flow
-1. User input -> `Composer` -> `DMessage` creation
-2. `ConversationHandler.messageAppend()` -> Store update
-3. `_handleExecute()` / `ConversationHandler.executeChatMessages()` -> AIX client request
-4. AIX streaming -> `ContentReassembler` -> UI updates
-5. Zustand auto-persistence -> IndexedDB
+### Database (Optional)
+Prisma schema at `src/server/prisma/schema.prisma`:
+- PostgreSQL with connection pooling
+- Single model: `LinkStorage` for chat link sharing (visibility, voting, expiration)
+- Not required for core functionality - app is local-first
 
-#### Beam Multi-Model Flow
-1. User triggers Beam -> `BeamStore.open()` state update
-2. Scatter: Parallel `aixChatGenerateContent()` to N models
-3. Real-time ray updates -> UI progress
-4. Gather: User selects fusion -> Combined output
-5. Result -> New message in conversation
+### Environment Configuration
+- Server env vars defined and validated in `src/server/env.ts`
+- Full variable reference: `docs/environment-variables.md`
+- HTTP Basic Auth via `middleware.ts` (optional)
 
-### Development Patterns
+## Security Considerations
 
-#### TypeScript & Code Quality
-- Type-safe through strict TypeScript interfaces
-- Clear interface-first approach for modules and components
-- Use latest TypeScript 5.9+ features
-- Use forward-looking patterns to minimize future refactors (e.g., discriminated unions, `satisfies` operator, as const assertions)
-- Type guards and exhaustiveChecks for robustness
-- Type inference where possible
-- Runtime validation with Zod schemas for API inputs/outputs (usually server-side, with the client importing as types the inferred types)
-
-#### Module Integration
-- Modules register with central registries (e.g., `vendors.registry.ts`)
-- Configuration objects define module behavior
-
-#### API Patterns
-- **tRPC routers** for type-safe API endpoints
-- **Zod schemas** for runtime validation
-- **tRPC procedures middleware** for authorization and logging (authorization is on a httpOnly cookie)
-- **Edge functions** for performance-critical operations
-
-#### Security Considerations
-- API keys in environment variables only (server-side); on the client they're in localStorage for now, but we want to move away from this
+- API keys stored client-side in localStorage (user-provided)
+- Server-side API keys in environment variables only
 - XSS protection through proper content escaping
-
-#### Writing Style
-- **Never use emdashes (—).** Use normal dashes (-) instead, in all generated text, code comments, and documentation.
-
+- No credential transmission to third parties
+- Optional HTTP Basic Auth middleware for deployment protection
 
 ## Common Development Tasks
 
-### Testing & Quality
-- Run `npm run lint` before committing
-- Type-check with `tsc --noEmit`
-- Test critical user flows manually
+### Adding a New LLM Vendor
+1. Create vendor directory in `src/modules/llms/vendors/[vendor]/`
+2. Implement `IModelVendor` interface (see `IModelVendor.ts`)
+3. Register in `vendors.registry.ts` (add to `ModelVendorId` type and `MODEL_VENDOR_REGISTRY`)
+4. Add server-side env vars to `src/server/env.ts` (if needed)
 
 ### Debugging Storage Issues
 - Check IndexedDB: DevTools -> Application -> IndexedDB -> `app-chats`
-- Monitor Zustand state: Use Zustand DevTools
+- Monitor Zustand state via React DevTools
 - Check migration logs in console during rehydration
 
+## Knowledge Base
 
-## Server Architecture
-
-The server uses a split architecture with two tRPC routers:
-
-### Edge Network (`trpc.router-edge`)
-Distributed edge runtime for low-latency AI operations:
-- **AIX** [1] - AI streaming and communication
-- **LLM Routers** [1] - Vendor-specific operations such as list models (OpenAI, Anthropic, Gemini, Ollama)
-- **Speex** [1] - Unified TTS router (ElevenLabs, Inworld, and other TTS vendors)
-- **External Services** - Google Search, YouTube transcripts
-
-[1]: also supports client-side fetch (CSF) via client-side inclusion (rebundling with stubs),
-for direct browser-to-API communication when possible (CORS), to reduce latency and network barriers
-
-Located at `/src/server/trpc/trpc.router-edge.ts`
-
-### Cloud Network (`trpc.router-cloud`)
-Centralized server for data processing operations:
-- **Browse** - Web scraping and content extraction
-- **Trade** - Import/export functionality (ChatGPT, markdown, JSON)
-
-Located at `/src/server/trpc/trpc.router-cloud.ts`
-
-**Key Pattern**: Edge runtime for AI (fast, distributed), Cloud runtime for data ops (centralized, Node.js)
+Architecture and system documentation is available in the `/kb/` knowledge base:
 
 @kb/KB.md
-
-@kb/vision-inlined.md
-
-As a side note, the product tiers (independent, non-VC-funded) are: **Open** (self-host, MIT) · **Free** (big-agi.com) · **Pro** (paid, includes Sync + backup). All tiers use the user's own API keys.
